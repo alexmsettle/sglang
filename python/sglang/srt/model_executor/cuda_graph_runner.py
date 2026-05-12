@@ -19,6 +19,7 @@ import bisect
 import contextlib
 import gc
 import inspect
+import json
 import logging
 import os
 from contextlib import contextmanager
@@ -568,6 +569,39 @@ def _default_make_graph_key(bs, stream_idx=None, variant_label=None):
     return key
 
 
+def _dump_cuda_graph_annotations() -> None:
+    """Write cuda_graph_markers kernel annotations to JSON after all graphs are captured.
+
+    Only runs when SGLANG_CUDA_GRAPH_ANNOTATIONS_PATH is set and the custom
+    pytorch fork with cuda_graph_markers support is present. The resulting file
+    can be passed to extract_network_graph.py via --annotations.
+    """
+    out_path = os.environ.get("SGLANG_CUDA_GRAPH_ANNOTATIONS_PATH", "")
+    if not out_path:
+        return
+    try:
+        from torch.cuda._graph_annotations import get_kernel_annotations
+
+        annotations = get_kernel_annotations()
+        if not annotations:
+            logger.warning(
+                "cuda_graph_markers: get_kernel_annotations() returned empty — "
+                "ensure the custom PyTorch fork is being used."
+            )
+            return
+        with open(out_path, "w") as f:
+            json.dump({str(k): v for k, v in annotations.items()}, f)
+        logger.info(
+            "cuda_graph_markers: wrote %d kernel annotations to %s",
+            len(annotations),
+            out_path,
+        )
+    except ImportError:
+        logger.debug(
+            "cuda_graph_markers: torch.cuda._graph_annotations not available, skipping annotation dump."
+        )
+
+
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
@@ -917,6 +951,8 @@ class CudaGraphRunner:
                         _capture_one_stream(i)
 
         _set_capture_lora_variant(None)
+
+        _dump_cuda_graph_annotations()
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
