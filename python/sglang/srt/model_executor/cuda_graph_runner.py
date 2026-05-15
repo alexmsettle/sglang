@@ -569,6 +569,59 @@ def _default_make_graph_key(bs, stream_idx=None, variant_label=None):
     return key
 
 
+def _add_fqn_annotation_hooks(model: torch.nn.Module) -> list:
+    """Register mark_kernels(fqn) forward hooks on every module so that
+    kernels captured inside a CUDA graph are tagged with their FQN."""
+    try:
+        from torch.cuda._graph_annotations import mark_kernels
+    except ImportError:
+        return []
+
+    handles: list = []
+    active_cms: dict = {}
+
+    for name, module in model.named_modules():
+        fqn = f"L.{name}" if name else "L"
+
+        def pre_hook(mod, _input, fqn=fqn):
+            cm = mark_kernels(fqn)
+            active_cms[id(mod)] = cm
+            cm.__enter__()
+
+        def post_hook(mod, _input, _output):
+            cm = active_cms.pop(id(mod), None)
+            if cm is not None:
+                cm.__exit__(None, None, None)
+
+        handles.append(module.register_forward_pre_hook(pre_hook))
+        handles.append(module.register_forward_hook(post_hook))
+
+    return handles
+
+
+def _prepare_cuda_graph_annotations(model: torch.nn.Module) -> tuple:
+    """Enable annotation infrastructure and register FQN hooks.
+
+    Returns (ann_active, hook_handles).
+    """
+    if not os.environ.get("SGLANG_CUDA_GRAPH_ANNOTATIONS_PATH", ""):
+        return False, []
+    try:
+        from torch.cuda._graph_annotations import (
+            clear_kernel_annotations,
+            enable_annotations,
+        )
+        clear_kernel_annotations()
+        enable_annotations()
+        handles = _add_fqn_annotation_hooks(model)
+        return True, handles
+    except ImportError:
+        logger.debug(
+            "cuda_graph_markers: torch.cuda._graph_annotations not available, skipping."
+        )
+        return False, []
+
+
 def _dump_cuda_graph_annotations() -> None:
     """Write cuda_graph_markers kernel annotations to JSON after all graphs are captured.
 
@@ -589,6 +642,7 @@ def _dump_cuda_graph_annotations() -> None:
                 "ensure the custom PyTorch fork is being used."
             )
             return
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
         with open(out_path, "w") as f:
             json.dump({str(k): v for k, v in annotations.items()}, f)
         logger.info(
@@ -935,6 +989,10 @@ class CudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
+        ann_active, ann_hooks = _prepare_cuda_graph_annotations(
+            self.model_runner.model)
+        self._ann_active = ann_active
+
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             if not self.enable_pdmux:
                 with graph_capture() as graph_capture_context, profile_context as prof:
@@ -949,6 +1007,10 @@ class CudaGraphRunner:
                     ):
                         self.stream = graph_capture_context.stream
                         _capture_one_stream(i)
+
+        for h in ann_hooks:
+            h.remove()
+        self._ann_active = False
 
         _set_capture_lora_variant(None)
 
@@ -1166,6 +1228,9 @@ class CudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            # resolve_pending_annotations() must be called inside the graph
+            # capture context so annotations are associated with this graph.
+            _resolve_annotations = getattr(self, "_ann_active", False)
             set_dp_buffer_len(
                 global_dp_buffer_len,
                 num_tokens,
@@ -1194,6 +1259,14 @@ class CudaGraphRunner:
                 forward_batch,
                 **kwargs,
             )
+            if _resolve_annotations:
+                try:
+                    from torch.cuda._graph_annotations import (
+                        resolve_pending_annotations,
+                    )
+                    resolve_pending_annotations()
+                except ImportError:
+                    pass
             return logits_output_or_pp_proxy_tensors
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -1221,6 +1294,13 @@ class CudaGraphRunner:
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
+
+        if getattr(self, "_ann_active", False):
+            try:
+                from torch.cuda._graph_annotations import remap_to_exec_graph
+                remap_to_exec_graph(graph)
+            except ImportError:
+                pass
 
         return graph, out
 
