@@ -393,6 +393,8 @@ class SGLangBackend:
         self.inductor_config = {
             "enable_auto_functionalized_v2": False,
         }
+        if os.environ.get("SGLANG_CUDA_GRAPH_ANNOTATIONS_PATH"):
+            self.inductor_config["triton.cudagraph_kernel_annotations"] = True
         self.compile_config = config
 
     def configure_post_pass(self):
