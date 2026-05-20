@@ -604,7 +604,17 @@ def _prepare_cuda_graph_annotations(model: torch.nn.Module) -> tuple:
 
     Returns (ann_active, hook_handles).
     """
-    if not os.environ.get("SGLANG_CUDA_GRAPH_ANNOTATIONS_PATH", ""):
+    ann_path = os.environ.get("SGLANG_CUDA_GRAPH_ANNOTATIONS_PATH", "")
+    logger.info(
+        "cuda_graph_markers[prepare]: entered; "
+        "SGLANG_CUDA_GRAPH_ANNOTATIONS_PATH=%r, model_type=%s",
+        ann_path,
+        type(model).__name__,
+    )
+    if not ann_path:
+        logger.info(
+            "cuda_graph_markers[prepare]: env var unset; skipping annotation setup."
+        )
         return False, []
     try:
         from torch.cuda._graph_annotations import (
@@ -614,10 +624,18 @@ def _prepare_cuda_graph_annotations(model: torch.nn.Module) -> tuple:
         clear_kernel_annotations()
         enable_annotations()
         handles = _add_fqn_annotation_hooks(model)
+        logger.info(
+            "cuda_graph_markers[prepare]: enable_annotations() called; "
+            "registered %d forward hook handles on %s",
+            len(handles),
+            type(model).__name__,
+        )
         return True, handles
-    except ImportError:
-        logger.debug(
-            "cuda_graph_markers: torch.cuda._graph_annotations not available, skipping."
+    except ImportError as e:
+        logger.warning(
+            "cuda_graph_markers[prepare]: torch.cuda._graph_annotations "
+            "ImportError: %s; skipping.",
+            e,
         )
         return False, []
 
@@ -630,7 +648,15 @@ def _dump_cuda_graph_annotations() -> None:
     can be passed to extract_network_graph.py via --annotations.
     """
     out_path = os.environ.get("SGLANG_CUDA_GRAPH_ANNOTATIONS_PATH", "")
+    logger.info(
+        "cuda_graph_markers[dump]: entered; "
+        "SGLANG_CUDA_GRAPH_ANNOTATIONS_PATH=%r",
+        out_path,
+    )
     if not out_path:
+        logger.info(
+            "cuda_graph_markers[dump]: env var unset; skipping annotation dump."
+        )
         return
     try:
         from torch.cuda._graph_annotations import get_kernel_annotations
@@ -638,7 +664,7 @@ def _dump_cuda_graph_annotations() -> None:
         annotations = get_kernel_annotations()
         if not annotations:
             logger.warning(
-                "cuda_graph_markers: get_kernel_annotations() returned empty — "
+                "cuda_graph_markers[dump]: get_kernel_annotations() returned empty — "
                 "ensure the custom PyTorch fork is being used."
             )
             return
@@ -646,13 +672,15 @@ def _dump_cuda_graph_annotations() -> None:
         with open(out_path, "w") as f:
             json.dump({str(k): v for k, v in annotations.items()}, f)
         logger.info(
-            "cuda_graph_markers: wrote %d kernel annotations to %s",
+            "cuda_graph_markers[dump]: wrote %d kernel annotations to %s",
             len(annotations),
             out_path,
         )
-    except ImportError:
-        logger.debug(
-            "cuda_graph_markers: torch.cuda._graph_annotations not available, skipping annotation dump."
+    except ImportError as e:
+        logger.warning(
+            "cuda_graph_markers[dump]: torch.cuda._graph_annotations "
+            "ImportError: %s; skipping annotation dump.",
+            e,
         )
 
 
