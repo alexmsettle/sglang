@@ -395,6 +395,20 @@ class SGLangBackend:
         }
         if os.environ.get("SGLANG_CUDA_GRAPH_ANNOTATIONS_PATH"):
             self.inductor_config["triton.cudagraph_kernel_annotations"] = True
+            # Companion knob: bypass FxGraphCache so structurally identical
+            # pieces (e.g. transformer layers 2..30 in Llama) each recompile
+            # with their own nn_module_stack-derived FQN, instead of all
+            # sharing one cached wrapper with one baked FQN. Cost is paid in
+            # warmup compile time only; no runtime impact. Requires the
+            # pytorch fork commit that adds this config option.
+            self.inductor_config[
+                "triton.force_disable_cache_for_kernel_annotations"
+            ] = True
+            logger.info(
+                "cuda_graph_markers[backend]: SGLANG_CUDA_GRAPH_ANNOTATIONS_PATH "
+                "set; inductor_config['triton.cudagraph_kernel_annotations']=True "
+                "+ ['triton.force_disable_cache_for_kernel_annotations']=True"
+            )
         self.compile_config = config
 
     def configure_post_pass(self):
