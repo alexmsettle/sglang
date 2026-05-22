@@ -569,36 +569,6 @@ def _default_make_graph_key(bs, stream_idx=None, variant_label=None):
     return key
 
 
-def _add_fqn_annotation_hooks(model: torch.nn.Module) -> list:
-    """Register mark_kernels(fqn) forward hooks on every module so that
-    kernels captured inside a CUDA graph are tagged with their FQN."""
-    try:
-        from torch.cuda._graph_annotations import mark_kernels
-    except ImportError:
-        return []
-
-    handles: list = []
-    active_cms: dict = {}
-
-    for name, module in model.named_modules():
-        fqn = f"L.{name}" if name else "L"
-
-        def pre_hook(mod, _input, fqn=fqn):
-            cm = mark_kernels(fqn)
-            active_cms[id(mod)] = cm
-            cm.__enter__()
-
-        def post_hook(mod, _input, _output):
-            cm = active_cms.pop(id(mod), None)
-            if cm is not None:
-                cm.__exit__(None, None, None)
-
-        handles.append(module.register_forward_pre_hook(pre_hook))
-        handles.append(module.register_forward_hook(post_hook))
-
-    return handles
-
-
 def _prepare_cuda_graph_annotations(
     model: torch.nn.Module, server_args: Any
 ) -> tuple:
@@ -634,6 +604,7 @@ def _prepare_cuda_graph_annotations(
         from torch.cuda._graph_annotations import (
             clear_kernel_annotations,
             enable_annotations,
+            register_fqn_annotation_hooks,
         )
         clear_kernel_annotations()
         enable_annotations()
@@ -647,10 +618,11 @@ def _prepare_cuda_graph_annotations(
                 "annotation infrastructure is armed during capture."
             )
             return True, []
-        handles = _add_fqn_annotation_hooks(model)
+        handles = register_fqn_annotation_hooks(model)
         logger.info(
             "cuda_graph_markers[prepare]: enable_annotations() called; "
-            "registered %d forward hook handles on %s",
+            "registered %d forward hook handles on %s via "
+            "torch.cuda._graph_annotations.register_fqn_annotation_hooks",
             len(handles),
             type(model).__name__,
         )
