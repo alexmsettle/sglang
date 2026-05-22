@@ -599,17 +599,31 @@ def _add_fqn_annotation_hooks(model: torch.nn.Module) -> list:
     return handles
 
 
-def _prepare_cuda_graph_annotations(model: torch.nn.Module) -> tuple:
+def _prepare_cuda_graph_annotations(
+    model: torch.nn.Module, server_args: Any
+) -> tuple:
     """Enable annotation infrastructure and register FQN hooks.
 
     Returns (ann_active, hook_handles).
+
+    When server_args.enable_torch_compile is True, the runtime nn.Module
+    forward-hook path is skipped. Under torch.compile, the SGLangBackend
+    (python/sglang/srt/compilation/backend.py) injects
+    triton.cudagraph_kernel_annotations into the inductor config, so
+    annotations are baked into the generated wrapper code at compile time
+    via mark_kernels(...) call sites. Running BOTH paths simultaneously has
+    caused a KeyError 140729... inside torch.compile's hook dispatch (likely
+    a re-entry / fake-module-id collision). The inductor bake alone provides
+    correct per-call-site FQNs in that mode, so the runtime hooks are dropped.
     """
     ann_path = os.environ.get("SGLANG_CUDA_GRAPH_ANNOTATIONS_PATH", "")
     logger.info(
         "cuda_graph_markers[prepare]: entered; "
-        "SGLANG_CUDA_GRAPH_ANNOTATIONS_PATH=%r, model_type=%s",
+        "SGLANG_CUDA_GRAPH_ANNOTATIONS_PATH=%r, model_type=%s, "
+        "enable_torch_compile=%s",
         ann_path,
         type(model).__name__,
+        getattr(server_args, "enable_torch_compile", "UNKNOWN"),
     )
     if not ann_path:
         logger.info(
@@ -623,6 +637,16 @@ def _prepare_cuda_graph_annotations(model: torch.nn.Module) -> tuple:
         )
         clear_kernel_annotations()
         enable_annotations()
+        if getattr(server_args, "enable_torch_compile", False):
+            logger.info(
+                "cuda_graph_markers[prepare]: enable_torch_compile=True; "
+                "skipping runtime nn.Module forward hooks "
+                "(SGLangBackend's inductor compile-time bake will populate "
+                "annotations via mark_kernels() call sites in the generated "
+                "wrapper code). enable_annotations() still called so the "
+                "annotation infrastructure is armed during capture."
+            )
+            return True, []
         handles = _add_fqn_annotation_hooks(model)
         logger.info(
             "cuda_graph_markers[prepare]: enable_annotations() called; "
@@ -1018,7 +1042,8 @@ class CudaGraphRunner:
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
         ann_active, ann_hooks = _prepare_cuda_graph_annotations(
-            self.model_runner.model)
+            self.model_runner.model, self.model_runner.server_args
+        )
         self._ann_active = ann_active
 
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
