@@ -609,13 +609,39 @@ def _prepare_cuda_graph_annotations(
         clear_kernel_annotations()
         enable_annotations()
         if getattr(server_args, "enable_torch_compile", False):
+            # SGLang's full-model torch.compile path (cuda_graph_runner.py
+            # patch_model() yields torch.compile(model.forward, mode=...))
+            # does NOT use SGLangBackend; it goes through inductor's default
+            # backend with mode="max-autotune-no-cudagraphs". So the
+            # SGLangBackend.__init__ injection of triton.cudagraph_kernel_annotations
+            # never fires. Set the inductor config GLOBALLY here instead, so
+            # the default inductor backend picks up the FQN bake flag.
+            # force_disable_cache_for_kernel_annotations bypasses FxGraphCache
+            # so structurally-identical compiled pieces (e.g. transformer
+            # layers 2..30) each emit their own per-call-site FQN instead of
+            # sharing one cached wrapper.
+            try:
+                import torch._inductor.config as ind_cfg
+                ind_cfg.triton.cudagraph_kernel_annotations = True
+                ind_cfg.triton.force_disable_cache_for_kernel_annotations = True
+                inductor_global_set = True
+            except Exception as e:
+                inductor_global_set = False
+                logger.warning(
+                    "cuda_graph_markers[prepare]: could not set "
+                    "torch._inductor.config.triton.cudagraph_kernel_annotations "
+                    "globally: %s", e,
+                )
             logger.info(
                 "cuda_graph_markers[prepare]: enable_torch_compile=True; "
-                "skipping runtime nn.Module forward hooks "
-                "(SGLangBackend's inductor compile-time bake will populate "
-                "annotations via mark_kernels() call sites in the generated "
-                "wrapper code). enable_annotations() still called so the "
-                "annotation infrastructure is armed during capture."
+                "skipping runtime nn.Module forward hooks; set "
+                "torch._inductor.config.triton.cudagraph_kernel_annotations=True "
+                "+ force_disable_cache_for_kernel_annotations=True globally=%s "
+                "(sglang's full-model torch.compile path uses default inductor "
+                "backend, not SGLangBackend, so the backend-side injection in "
+                "compilation/backend.py doesn't apply). enable_annotations() "
+                "still called so the annotation infrastructure is armed.",
+                inductor_global_set,
             )
             return True, []
         handles = register_fqn_annotation_hooks(model)
