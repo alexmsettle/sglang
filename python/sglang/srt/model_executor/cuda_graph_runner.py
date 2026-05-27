@@ -475,13 +475,26 @@ def patch_model(
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
             # even with ENABLE_INTRA_NODE_COMM=1.
             # tp_group.ca_comm = None
-            yield torch.compile(
-                torch.no_grad()(model.forward),
-                mode=os.environ.get(
-                    "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-                ),
-                dynamic=_is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE"),
-            )
+            #
+            # Compile the bound method `model.forward` directly. We deliberately
+            # do NOT wrap it in `torch.no_grad()(model.forward)` — that
+            # decorator-style invocation produces an anonymous closure that
+            # Dynamo treats as the trace root (`fn`), flattening nn_module_stack
+            # so inductor-emitted FQNs lose all module-path information
+            # (annotations come out as `L.fn.*` instead of
+            # `L.model.layers.N.input_layernorm.*`). The variant matrix in
+            # pytorch's test_cuda_graph_integration confirmed this is the
+            # sole cause of the FQN bug. Use `with torch.no_grad():` as a
+            # context manager around the `yield` so the compiled forward
+            # still runs in inference mode without grad tracking.
+            with torch.no_grad():
+                yield torch.compile(
+                    model.forward,
+                    mode=os.environ.get(
+                        "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+                    ),
+                    dynamic=_is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE"),
+                )
         else:
             yield model.forward
     finally:
