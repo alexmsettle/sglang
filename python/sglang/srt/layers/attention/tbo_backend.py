@@ -16,6 +16,18 @@ class TboAttnBackend(AttentionBackend):
         self.primary = primary
         self.children = children
 
+    def __getattr__(self, name: str):
+        # The TBO wrapper stands in for the underlying attention backend, so
+        # model code that reads plain attributes off ``forward_batch.attn_backend``
+        # (e.g. DeepSeek MLA reads ``data_type``, ``kv_cache_dtype``,
+        # ``num_kv_splits``, ``forward_metadata``) keeps working under TBO.
+        # ``__getattr__`` only fires for attributes not found on the wrapper, so
+        # the explicitly-defined methods below are unaffected. Guard ``primary``
+        # to avoid infinite recursion if it has not been set yet.
+        if name == "primary":
+            raise AttributeError(name)
+        return getattr(self.primary, name)
+
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):
         return cls(
