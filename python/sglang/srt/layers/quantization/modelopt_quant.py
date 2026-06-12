@@ -1752,6 +1752,40 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
+            # When expert-parallelism is active, w13_weight_scale_2 / w2_weight_scale_2
+            # are loaded already sliced to (num_local_experts,) by the EP-aware weight
+            # loader, but layer.w13_input_scale / layer.w2_input_scale arrive at full
+            # (num_experts, ...) shape. The two flashinfer branches above sidestep this
+            # by reducing the input scales to a scalar (cutlass/trtllm) or by explicitly
+            # slicing via _slice_scale (cutedsl). The generic else-branch — used by
+            # other moe-runner-backends (e.g. deep_gemm with --moe-a2a-backend=deepep)
+            # — never got the slicing wired in, so the later
+            #     (w13_input_scale * w13_weight_scale_2)
+            # broadcast fails with e.g. "size of tensor a (256) must match size of
+            # tensor b (64) at non-singleton dimension 0" for a 256-expert model with
+            # --ep-size=4. Slice to the local-expert range to match.
+            if (
+                getattr(layer, "moe_ep_size", 1) > 1
+                and getattr(layer, "num_local_experts", layer.num_experts)
+                != layer.num_experts
+            ):
+                assert (
+                    layer.moe_ep_size * layer.num_local_experts == layer.num_experts
+                ), (
+                    f"EP sharding inconsistency: moe_ep_size={layer.moe_ep_size} * "
+                    f"num_local_experts={layer.num_local_experts} != "
+                    f"num_experts={layer.num_experts}"
+                )
+                lo = layer.moe_ep_rank * layer.num_local_experts
+                hi = lo + layer.num_local_experts
+                if w13_input_scale.shape[0] == layer.num_experts:
+                    w13_input_scale = w13_input_scale[lo:hi]
+                if (
+                    w2_input_scale.ndim >= 1
+                    and w2_input_scale.shape[0] == layer.num_experts
+                ):
+                    w2_input_scale = w2_input_scale[lo:hi]
+
         # Create shared parameters
         copy_or_rebind_param(
             layer,
